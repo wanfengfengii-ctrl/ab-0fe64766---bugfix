@@ -11,11 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .solver import MAX_COST_VALUE, MAX_OBSERVATIONS, MAX_VARIABLES, Observation, Problem
+from .solver import MAX_OBSERVATIONS, MAX_VARIABLES, Observation, Problem
 
-#: Budgets above this are rejected (optimal polluted cost can never reach it,
-#: since total observation cost is bounded by MAX_OBSERVATIONS * MAX_COST_VALUE).
-MAX_BUDGET = 1_000_000_000_000
 MAX_NAME_LENGTH = 64
 
 _TOP_LEVEL_KEYS = {"variables", "observations", "references", "budget"}
@@ -106,14 +103,13 @@ def validate_payload(payload: Any) -> tuple[list[ApiError], Problem | None]:
                 variable_names.append(name)
 
     # ---- budget ------------------------------------------------------------
+    # The contract fixes only the type: a non-negative integer, of any size.
     if "budget" not in payload:
         errors.append(ApiError(_ptr("budget"), "缺少必填字段 budget"))
     else:
         budget = payload["budget"]
-        if not _is_plain_int(budget):
+        if not _is_plain_int(budget) or budget < 0:
             errors.append(ApiError(_ptr("budget"), "budget 必须是非负整数"))
-        elif not 0 <= budget <= MAX_BUDGET:
-            errors.append(ApiError(_ptr("budget"), f"budget 必须在 0 到 {MAX_BUDGET} 之间"))
 
     # ---- observations ------------------------------------------------------
     raw_observations = payload.get("observations")
@@ -174,13 +170,12 @@ def validate_payload(payload: Any) -> tuple[list[ApiError], Problem | None]:
                 errors.append(ApiError(base + "/xor_value", "xor_value 必须是 0 或 1"))
 
             cost = item.get("cost")
-            cost_ok = _is_plain_int(cost) and 1 <= cost <= MAX_COST_VALUE
+            # The contract fixes only the type: a positive integer, of any size.
+            cost_ok = _is_plain_int(cost) and cost >= 1
             if "cost" not in item:
                 errors.append(ApiError(base + "/cost", "缺少必填字段 cost"))
-            elif not _is_plain_int(cost) or cost < 1:
+            elif not cost_ok:
                 errors.append(ApiError(base + "/cost", "cost 必须是正整数"))
-            elif cost > MAX_COST_VALUE:
-                errors.append(ApiError(base + "/cost", f"cost 不得超过 {MAX_COST_VALUE}"))
 
             if oid_ok and left_ok and right_ok and xor_ok and cost_ok:
                 parsed_observations.append((i, oid, left, right, xor_value, cost))

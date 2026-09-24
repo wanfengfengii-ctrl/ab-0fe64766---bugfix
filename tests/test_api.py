@@ -344,6 +344,109 @@ def test_consistent_duplicate_references_allowed():
     assert r.json()["adjudication"]["assignment"] == {"a": 1}
 
 
+def test_cost_has_no_numeric_upper_limit():
+    # The contract bounds cost only to positive integers; 1_000_000_001 must
+    # be accepted and adjudicated exactly (optimum equals the budget).
+    payload = {
+        "variables": ["a"],
+        "observations": [
+            {"id": "o1", "left": "a", "right": "a", "xor_value": 1, "cost": 1_000_000_001}
+        ],
+        "references": [{"variable": "a", "value": 0}],
+        "budget": 1_000_000_001,
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["decision"] == "accepted"
+    assert data["adjudication"]["unique_optimum"] is True
+    assert data["adjudication"]["assignment"] == {"a": 0}
+    assert data["adjudication"]["optimal"]["polluted_cost"] == 1_000_000_001
+    assert data["adjudication"]["optimal"]["polluted_count"] == 1
+    assert data["adjudication"]["polluted_observation_ids"] == ["o1"]
+    assert data["budget"]["within_budget"] is True
+    assert data["budget"]["slack"] == 0
+
+
+def test_budget_has_no_numeric_upper_limit():
+    # The contract bounds budget only to non-negative integers.
+    payload = {
+        "variables": ["a"],
+        "observations": [],
+        "references": [{"variable": "a", "value": 0}],
+        "budget": 1_000_000_000_001,
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["decision"] == "accepted"
+    assert data["adjudication"]["unique_optimum"] is True
+    assert data["adjudication"]["optimal"]["polluted_cost"] == 0
+    assert data["budget"]["limit"] == 1_000_000_000_001
+    assert data["budget"]["slack"] == 1_000_000_000_001
+
+
+def test_large_costs_near_equal_exact_adjudication():
+    # Optimum decided by a margin of 2 at ~2e16 (below float64 resolution of
+    # the combined energy); the response must remain exactly recomputable.
+    payload = {
+        "variables": ["a", "b"],
+        "observations": [
+            {"id": "const", "left": "a", "right": "a", "xor_value": 1, "cost": 10**16 + 1},
+            {"id": "neq", "left": "a", "right": "b", "xor_value": 0, "cost": 10**16},
+            {"id": "eq", "left": "a", "right": "b", "xor_value": 1, "cost": 10**16 + 2},
+        ],
+        "references": [],
+        "budget": 3 * 10**16,
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["decision"] == "accepted"
+    adjudication = data["adjudication"]
+    assert adjudication["optimal"]["polluted_cost"] == 2 * 10**16 + 1
+    assert adjudication["optimal"]["polluted_count"] == 2
+    assert adjudication["unique_optimum"] is False
+    assert adjudication["assignment"] == {"a": 0, "b": 1}
+    assert adjudication["witness"]["assignment"] == {"a": 1, "b": 0}
+
+    cost, count, combined, ok = recompute_from_response(payload, data)
+    assert ok
+    assert cost == 2 * 10**16 + 1
+    assert count == 2
+    assert combined == adjudication["optimal"]["combined_objective"]
+    wcost, wcount, wcombined, wok = recompute_from_response(payload, data, which="witness")
+    assert wok
+    assert (wcost, wcount, wcombined) == (cost, count, combined)
+
+
+def test_large_costs_cancellation_and_budget_rejection():
+    # Equal-cost complementary observations: every assignment pays exactly
+    # 10**25 + 7; a budget one below that must reject with the exact excess.
+    c = 10**25 + 7
+    payload = {
+        "variables": ["a", "b"],
+        "observations": [
+            {"id": "eq", "left": "a", "right": "b", "xor_value": 1, "cost": c},
+            {"id": "neq", "left": "a", "right": "b", "xor_value": 0, "cost": c},
+        ],
+        "references": [],
+        "budget": c - 1,
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["decision"] == "rejected"
+    assert data["reason"] == "optimal_polluted_cost_exceeds_budget"
+    assert data["adjudication"]["optimal"]["polluted_cost"] == c
+    assert data["adjudication"]["optimal"]["polluted_count"] == 1
+    assert data["adjudication"]["unique_optimum"] is False
+    assert data["adjudication"]["assignment"] == {"a": 0, "b": 0}
+    assert data["adjudication"]["witness"]["assignment"] == {"a": 0, "b": 1}
+    assert data["budget"]["excess"] == 1
+    assert data["budget"]["slack"] is None
+
+
 @pytest.mark.slow
 def test_maximum_size_deterministic_and_recomputable():
     rng = random.Random(42)

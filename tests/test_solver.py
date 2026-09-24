@@ -231,6 +231,98 @@ def test_all_fixed_assignment():
     assert sol.violated_ids == ("o1",)
 
 
+def test_large_costs_near_equal_exact():
+    # Margin of 2 at ~2e16: indistinguishable in a float64 combined energy,
+    # so only exact integer evaluation can pick the right optimum.
+    observations = (
+        Observation("self", 0, 0, 1, 10**16 + 1),  # always violated
+        Observation("neq", 0, 1, 0, 10**16),       # violated iff a != b
+        Observation("eq", 0, 1, 1, 10**16 + 2),    # violated iff a == b
+    )
+    sol = solve(Problem(("a", "b"), observations, {}))
+    assert sol.optimal_cost == 2 * 10**16 + 1
+    assert sol.optimal_polluted_count == 2
+    assert sol.unique is False
+    assert sol.assignment == {"a": 0, "b": 1}
+    assert sol.witness == {"a": 1, "b": 0}
+    assert sol.witness_polluted_cost == sol.optimal_cost
+    assert sol.witness_polluted_count == sol.optimal_polluted_count
+    assert sol.violated_ids == ("neq", "self")
+
+
+def test_large_costs_cancellation_all_assignments_optimal():
+    # Complementary observations with equal huge cost: exactly one is
+    # violated under every assignment, so all assignments are optimal and
+    # the linear/pair energy coefficients cancel to zero.
+    c = 10**30 + 7
+    observations = (
+        Observation("eq", 0, 1, 1, c),   # violated iff a == b
+        Observation("neq", 0, 1, 0, c),  # violated iff a != b
+    )
+    sol = solve(Problem(("a", "b"), observations, {}))
+    assert sol.optimal_cost == c
+    assert sol.optimal_polluted_count == 1
+    assert sol.unique is False
+    assert sol.assignment == {"a": 0, "b": 0}
+    assert sol.witness == {"a": 0, "b": 1}
+    assert sol.witness_polluted_cost == c
+
+
+def test_large_costs_unique_optimum_with_reference():
+    c = 10**18 + 3
+    observations = (Observation("impossible", 0, 0, 1, c),)
+    sol = solve(Problem(("a",), observations, {0: 0}))
+    assert sol.unique is True
+    assert sol.witness is None
+    assert sol.assignment == {"a": 0}
+    assert sol.optimal_cost == c
+    assert sol.violated_ids == ("impossible",)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_solver_matches_brute_force_large_costs(seed):
+    rng = random.Random(10_000 + seed)
+    n = rng.randrange(1, 8)
+    m = rng.randrange(1, 12)
+    names = tuple(f"v{k:02d}" for k in range(n))
+    observations = []
+    for k in range(m):
+        cost = rng.choice(
+            [
+                rng.randrange(1, 100),
+                10**9 + rng.randrange(-2, 3),
+                10**15 + rng.randrange(1000),
+                10**22 + rng.randrange(-5, 6),
+                10**40 + rng.randrange(10**6),
+            ]
+        )
+        observations.append(
+            Observation(
+                id=f"obs-{k:03d}",
+                left_rank=rng.randrange(n),
+                right_rank=rng.randrange(n),
+                xor_value=rng.randrange(2),
+                cost=cost,
+            )
+        )
+    fixed = {r: rng.randrange(2) for r in range(n) if rng.random() < 0.3}
+    problem = Problem(names, tuple(observations), fixed)
+    solution = solve(problem)
+
+    best_combined, best_assignments = brute_force(
+        problem.variable_names, problem.observations, problem.fixed
+    )
+    assert SCALE * solution.optimal_cost + solution.optimal_polluted_count == best_combined
+    assert solution.unique == (len(best_assignments) == 1)
+    lexicographic = sorted(best_assignments, key=lambda x: tuple(x[r] for r in range(n)))
+    assert solution.assignment == {names[r]: lexicographic[0][r] for r in range(n)}
+    if not solution.unique:
+        assert solution.witness == {names[r]: lexicographic[1][r] for r in range(n)}
+        assert solution.witness_polluted_cost == solution.optimal_cost
+    else:
+        assert solution.witness is None
+
+
 def test_no_observations_fast_path():
     names = ("a", "b", "c")
     sol = solve(Problem(names, (), {}))

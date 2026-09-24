@@ -17,22 +17,32 @@ evaluated with a few BLAS matrix products (numpy).
 
 Exactness
 ---------
-The lexicographic pair (cost, count) is minimized by evaluating two energy
-polynomials separately:
+Observation costs are arbitrary positive integers with no upper bound, so
+every energy coefficient is kept as an exact Python integer and the optimum
+is located with one of two regimes, both exact:
 
-* cost energy, weight ``c`` per observation, an integer in [0, 120 * MAX_COST]
-  (<= 1.2e11);
-* count energy, weight 1 per observation, an integer in [0, 120].
+* Single pass (every coefficient below 2**38, covering the whole classic
+  120 x 1e9 cost regime): the cost energy (integer in [0, total cost]) and
+  the count energy (integer in [0, 120]) are evaluated directly in float64.
+  A standard dot-product error bound (gamma_n = n * 2**-53) keeps the
+  evaluation error well under ``ROUND_TOLERANCE`` of the nearest integer, so
+  rounding to it is exact.
+* Component scan (larger coefficients): every coefficient is decomposed into
+  signed base-2**k digits (k = 28, halved on demand down to 1) and each
+  digit's energy polynomial is evaluated in float64 under the same error
+  bound — digit magnitudes below 2**28 keep the error under ~0.1. Rounding
+  recovers every exact integer component energy, carries are normalized
+  across components, and assignments are then ordered by the exact total
+  cost (most significant digit first) and finally by the polluted count.
 
-Both are computed in float64. Coefficients are integer sums of at most 120
-terms, and a standard dot-product error bound (gamma_n = n * 2**-53) bounds the
-evaluation error of the cost energy by well under 0.1 (and the count energy by
-~1e-9); each block is rounded to the nearest integer and the residual is
-verified against ``ROUND_TOLERANCE``. The combined scalar objective
+A per-block residual check guards every rounding; a violation falls back to
+the component scan with a narrower (hence even more accurate) digit width.
+
+The combined scalar objective
 
     combined = SCALE * cost + count,   SCALE = MAX_OBSERVATIONS + 1
 
-is then formed in exact int64 arithmetic. Since count <= MAX_OBSERVATIONS <
+is formed in exact integer arithmetic. Since count <= MAX_OBSERVATIONS <
 SCALE, minimizing it is exactly equivalent to the lexicographic pair. The
 chosen assignment is finally re-evaluated with pure integer arithmetic as an
 end-to-end guard.
@@ -58,17 +68,25 @@ MAX_OBSERVATIONS = 120
 #: Must be strictly greater than the maximum possible polluted count.
 SCALE = MAX_OBSERVATIONS + 1
 
-#: Maximum accepted observation cost. With 120 observations the cost energy is
-#: then at most 1.2e11, where the float64 block evaluation error is strictly
-#: below 0.1 (see module docstring), so nearest-integer rounding is exact.
-MAX_COST_VALUE = 1_000_000_000
-
 #: Number of "fast" (inner, block-local) free variables in the split scan.
 #: A block holds 2**FAST_BITS assignments (~524k here, ~80 MB float64/array).
 FAST_BITS = 19
 
 #: Every float64 block energy must be within this distance of an integer.
 ROUND_TOLERANCE = 0.25
+
+#: Coefficient magnitude up to which the single-pass float64 evaluation is
+#: provably exact (covers the classic 120 x 1e9 cost regime with margin).
+_SINGLE_PASS_COEFF_LIMIT = 2**38
+
+#: Digit width (bits) of the signed base-2**k decomposition used by the exact
+#: component scan for larger coefficients. At k = 28 every component matrix
+#: entry is below 2**35 and the float64 evaluation error of each component
+#: energy is bounded by ~0.1, well under ROUND_TOLERANCE.
+_COMPONENT_BITS = 28
+
+#: Sentinel above any base-2**k digit or polluted count, for masked minima.
+_LEX_INF = 1 << 60
 
 
 @dataclass(frozen=True)
@@ -111,21 +129,33 @@ class SolverError(RuntimeError):
     """Unexpected internal failure of the exact solver."""
 
 
+class _ResidualError(SolverError):
+    """A float64 block energy was too far from any integer to round exactly.
+
+    Triggers a retry with the (slower, even more accurate) component scan or
+    a narrower digit width; never silently produces an inexact result.
+    """
+
+
 @dataclass
 class _QuadraticEnergy:
-    """E(x) = constant + linear^T x + x^T matrix x over the free variables."""
+    """E(x) = constant + linear^T x + x^T pair x over the free variables.
 
-    constant: float
-    linear: np.ndarray
-    pair: np.ndarray
+    Coefficients are exact Python integers (observation costs have no upper
+    bound), so the energy can be evaluated exactly for any input size.
+    """
+
+    constant: int
+    linear: list[int]
+    pair: list[list[int]]
 
     @classmethod
     def zeros(cls, f: int) -> "_QuadraticEnergy":
-        return cls(0.0, np.zeros(f, dtype=np.float64), np.zeros((f, f), dtype=np.float64))
+        return cls(0, [0] * f, [[0] * f for _ in range(f)])
 
     def add_observation(
         self,
-        weight: float,
+        weight: int,
         a: int,
         b: int,
         xor_value: int,
@@ -135,12 +165,12 @@ class _QuadraticEnergy:
         """Add the violation indicator of one XOR observation times weight."""
         if xor_value == 0:
             # violated iff xa != xb:  xa + xb - 2 xa xb
-            ca = cb = 1.0
-            cab = -2.0
+            ca = cb = 1
+            cab = -2
         else:
             # violated iff xa == xb:  1 - xa - xb + 2 xa xb
-            ca = cb = -1.0
-            cab = 2.0
+            ca = cb = -1
+            cab = 2
             self.constant += weight
 
         a_fixed = a in fixed
@@ -169,14 +199,62 @@ class _QuadraticEnergy:
                 # xa * xa == xa for a binary variable
                 self.linear[pa] += cab * weight
             else:
-                self.pair[pa, pb] += cab * weight
-                self.pair[pb, pa] += cab * weight
+                self.pair[pa][pb] += cab * weight
+                self.pair[pb][pa] += cab * weight
+
+    def max_abs_coefficient(self) -> int:
+        """Largest |coefficient| among constant, linear and pair entries."""
+        hi = abs(self.constant)
+        for value in self.linear:
+            hi = max(hi, abs(value))
+        for row in self.pair:
+            for value in row:
+                hi = max(hi, abs(value))
+        return hi
 
     def matrix(self) -> tuple[float, np.ndarray]:
-        """Return (constant, M) with E = constant + x^T M x (linear on diag)."""
-        m = self.pair / 2.0
-        np.fill_diagonal(m, self.linear)
-        return self.constant, m
+        """Return (constant, M) with E = constant + x^T M x (linear on diag).
+
+        The float64 conversion is exact only when every coefficient fits a
+        float64 mantissa; callers use this solely in the single-pass regime
+        where that is guaranteed.
+        """
+        f = len(self.linear)
+        m = np.zeros((f, f), dtype=np.float64)
+        if f:
+            m = np.array(self.pair, dtype=np.float64) / 2.0
+            np.fill_diagonal(m, np.array(self.linear, dtype=np.float64))
+        return float(self.constant), m
+
+    def component(self, j: int, k: int) -> tuple[int, np.ndarray]:
+        """(const, M) for signed base-2**k digit ``j`` of every coefficient.
+
+        Each coefficient c is decomposed as c = sum_j d_j * 2**(j*k) with
+        signed digits |d_j| < 2**k (base-2**k digits of |c|, sign of c), so
+        the exact energy is E(x) = sum_j E_j(x) * 2**(j*k) where E_j is the
+        energy of the returned (const, M) pair. Entries may be half-integers
+        (odd pair digits are halved symmetrically); all are exactly
+        representable in float64.
+        """
+        shift = j * k
+        mask = (1 << k) - 1
+
+        def digit(c: int) -> int:
+            d = (abs(c) >> shift) & mask
+            return -d if c < 0 else d
+
+        f = len(self.linear)
+        m = np.zeros((f, f), dtype=np.float64)
+        for a in range(f):
+            m[a, a] = digit(self.linear[a])
+            row = self.pair[a]
+            for b in range(a + 1, f):
+                value = row[b]
+                if value:
+                    half = digit(value) / 2.0
+                    m[a, b] = half
+                    m[b, a] = half
+        return digit(self.constant), m
 
 
 def solve(problem: Problem) -> Solution:
@@ -226,14 +304,16 @@ def solve(problem: Problem) -> Solution:
             fixed=fixed,
             free_pos=free_pos,
         )
-        cost_energy.add_observation(float(obs.cost), **kwargs)
-        count_energy.add_observation(1.0, **kwargs)
+        cost_energy.add_observation(obs.cost, **kwargs)
+        count_energy.add_observation(1, **kwargs)
 
-    cost_const, cost_matrix = cost_energy.matrix()
+    # Count coefficients are at most 2 * MAX_OBSERVATIONS, so the count
+    # energy is always evaluated exactly in a single float64 pass.
     count_const, count_matrix = count_energy.matrix()
+    total_cost = sum(obs.cost for obs in observations)
 
     first_code, second_code, best_combined = _enumerate(
-        cost_matrix, cost_const, count_matrix, count_const, f
+        cost_energy, count_matrix, count_const, f, total_cost
     )
 
     def decode(code: int) -> dict[str, int]:
@@ -288,14 +368,61 @@ def solve(problem: Problem) -> Solution:
     )
 
 
+def _round_exact(energies: np.ndarray, label: str) -> np.ndarray:
+    """Round block energies to their exact integer values, with a guard."""
+    rounded = np.rint(energies)
+    residual = np.max(np.absolute(energies - rounded)) if energies.size else 0.0
+    if residual > ROUND_TOLERANCE:
+        raise _ResidualError(
+            f"{label} energy rounding residual {residual:.6f} exceeds tolerance "
+            f"{ROUND_TOLERANCE}; falling back to a narrower evaluation"
+        )
+    return rounded.astype(np.int64)
+
+
 def _enumerate(
+    cost_energy: _QuadraticEnergy,
+    count_matrix: np.ndarray,
+    count_constant: float,
+    f: int,
+    total_cost: int,
+) -> tuple[int, int, int]:
+    """Locate the optimum over all 2**f assignments, exactly.
+
+    Returns (first_code, second_code, best_combined); second_code is -1 when
+    the optimum is unique. Uses the single-pass float64 scan when every cost
+    coefficient is small enough for it to be provably exact, and otherwise
+    the exact component scan; a rounding-residual violation in either regime
+    falls back to a narrower, even more accurate evaluation.
+    """
+    if cost_energy.max_abs_coefficient() <= _SINGLE_PASS_COEFF_LIMIT:
+        cost_constant, cost_matrix = cost_energy.matrix()
+        try:
+            return _enumerate_single(
+                cost_matrix, cost_constant, count_matrix, count_constant, f
+            )
+        except _ResidualError:
+            pass  # fall through to the exact component scan
+    k = _COMPONENT_BITS
+    while True:
+        try:
+            return _enumerate_components(
+                cost_energy, count_matrix, count_constant, f, total_cost, k
+            )
+        except _ResidualError:
+            if k <= 1:
+                raise
+            k = max(1, k // 2)
+
+
+def _enumerate_single(
     cost_matrix: np.ndarray,
     cost_constant: float,
     count_matrix: np.ndarray,
     count_constant: float,
     f: int,
 ) -> tuple[int, int, int]:
-    """Scan all 2**f assignments in lexicographic order.
+    """Scan all 2**f assignments in lexicographic order (single float64 pass).
 
     Returns (first_code, second_code, best_combined); second_code is -1 when
     the optimum is unique. Variable ``pos`` is bit ``f-1-pos`` of the code, so
@@ -327,16 +454,6 @@ def _enumerate(
     first_code = -1
     second_code = -1
 
-    def round_exact(energies: np.ndarray, label: str) -> np.ndarray:
-        rounded = np.rint(energies)
-        residual = np.max(np.absolute(energies - rounded)) if energies.size else 0.0
-        if residual > ROUND_TOLERANCE:
-            raise SolverError(
-                f"{label} energy rounding residual {residual:.6f} exceeds tolerance "
-                f"{ROUND_TOLERANCE}; enumeration is not exact on this input"
-            )
-        return rounded.astype(np.int64)
-
     def absorb(block: int, combined: np.ndarray) -> None:
         nonlocal best_combined, first_code, second_code
         minimum = int(combined.min())
@@ -354,8 +471,8 @@ def _enumerate(
             second_code = first
 
     if q == 0:
-        cost_e = round_exact(cost_constant + cost_base, "cost")
-        count_e = round_exact(count_constant + count_base, "count")
+        cost_e = _round_exact(cost_constant + cost_base, "cost")
+        count_e = _round_exact(count_constant + count_base, "count")
         absorb(0, SCALE * cost_e + count_e)
     else:
         hi_powers = np.arange(q - 1, -1, -1, dtype=np.int64)
@@ -365,13 +482,120 @@ def _enumerate(
             count_block_const = count_constant + float(slow @ k_ss @ slow)
             cost_cross = 2.0 * (c_sf.T @ slow)
             count_cross = 2.0 * (k_sf.T @ slow)
-            cost_e = round_exact(
+            cost_e = _round_exact(
                 cost_block_const + cost_base + fast_bits @ cost_cross, "cost"
             )
-            count_e = round_exact(
+            count_e = _round_exact(
                 count_block_const + count_base + fast_bits @ count_cross, "count"
             )
             absorb(block, SCALE * cost_e + count_e)
 
     assert best_combined is not None and first_code >= 0
     return first_code, second_code, int(best_combined)
+
+
+def _enumerate_components(
+    cost_energy: _QuadraticEnergy,
+    count_matrix: np.ndarray,
+    count_constant: float,
+    f: int,
+    total_cost: int,
+    k: int,
+) -> tuple[int, int, int]:
+    """Scan all 2**f assignments with exact arbitrary-size integer costs.
+
+    Every cost coefficient is split into signed base-2**k digits; each digit
+    energy is evaluated with the same block pipeline as the single-pass scan
+    and rounded to its exact integer value. Per assignment the digit energies
+    are carry-normalized into the canonical base-2**k representation of the
+    exact total cost, and assignments are ordered by (cost digits from most
+    to least significant, then polluted count) — exactly the lexicographic
+    (cost, count) order, for costs of any size.
+    """
+    hi = max(cost_energy.max_abs_coefficient(), total_cost, 1)
+    # 2**(s*k) exceeds every coefficient and every attainable total cost, so
+    # the digit decomposition is complete and the final carry is always zero.
+    s = max(2, hi.bit_length() // k + 2)
+    components = [cost_energy.component(j, k) for j in range(s)]
+
+    p = min(f, FAST_BITS)
+    q = f - p
+
+    lo_powers = np.arange(p - 1, -1, -1, dtype=np.int64)
+    base_index = np.arange(1 << p, dtype=np.int64)
+    fast_bits = ((base_index[:, None] >> lo_powers[None, :]) & 1).astype(np.float64)
+
+    def parts(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        m_ss = matrix[:q, :q]
+        m_sf = matrix[:q, q:]
+        m_ff = matrix[q:, q:]
+        base = ((fast_bits @ m_ff) * fast_bits).sum(axis=1)
+        return m_ss, m_sf, base
+
+    component_parts = [
+        (const, *parts(matrix)) for const, matrix in components
+    ]
+    n_ss, n_sf, count_base = parts(count_matrix)
+
+    hi_powers = np.arange(q - 1, -1, -1, dtype=np.int64)
+    mask = (1 << k) - 1
+    n_block = 1 << p
+
+    best_key: tuple[int, int] | None = None  # (exact cost, count)
+    first_code = -1
+    second_code = -1
+
+    for block in range(1 << q):
+        slow = ((block >> hi_powers) & 1).astype(np.float64)
+
+        count_block_const = count_constant + float(slow @ n_ss @ slow)
+        count_cross = 2.0 * (n_sf.T @ slow)
+        count_e = _round_exact(
+            count_block_const + count_base + fast_bits @ count_cross, "count"
+        )
+
+        energy_columns = []
+        for const_j, c_ss, c_sf, cost_base in component_parts:
+            block_const = const_j + float(slow @ c_ss @ slow)
+            cross = 2.0 * (c_sf.T @ slow)
+            energy_columns.append(
+                _round_exact(block_const + cost_base + fast_bits @ cross, "cost")
+            )
+
+        # Carry normalization: signed component energies -> canonical
+        # non-negative base-2**k digits of the exact total cost.
+        carry = np.zeros(n_block, dtype=np.int64)
+        digit_columns = []
+        for column in energy_columns:
+            v = column + carry
+            digit_columns.append(v & mask)
+            carry = v >> k  # arithmetic shift: floor division, exact
+        if np.any(carry):
+            raise SolverError("internal carry normalization failed")
+
+        # Block minimum in (cost digits high->low, then count) order.
+        alive = np.ones(n_block, dtype=bool)
+        for column in reversed(digit_columns):
+            minimum = np.where(alive, column, _LEX_INF).min()
+            alive &= column == minimum
+        minimum = np.where(alive, count_e, _LEX_INF).min()
+        alive &= count_e == minimum
+        hits = np.flatnonzero(alive)
+        first = int(hits[0])
+
+        block_cost = 0
+        for j, column in enumerate(digit_columns):
+            block_cost += int(column[first]) << (j * k)
+        key = (block_cost, int(count_e[first]))
+        block_first = (block << p) + first
+        if best_key is None or key < best_key:
+            best_key = key
+            first_code = block_first
+            second_code = (block << p) + int(hits[1]) if hits.size > 1 else -1
+        elif key == best_key and second_code < 0:
+            # Same optimum, later lexicographic block: first new hit is the
+            # second distinct optimal assignment.
+            second_code = block_first
+
+    assert best_key is not None and first_code >= 0
+    return first_code, second_code, SCALE * best_key[0] + best_key[1]

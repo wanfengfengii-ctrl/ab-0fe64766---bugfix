@@ -100,6 +100,70 @@ def test_solver_matches_brute_force(seed):
         assert solution.witness_violated_ids is None
 
 
+def make_problem_with_costs(rng, n, m, cost_pool, fix_prob=0.3):
+    names = tuple(f"v{k:02d}" for k in range(n))
+    observations = []
+    for k in range(m):
+        a = rng.randrange(n)
+        b = rng.randrange(n)
+        observations.append(
+            Observation(
+                id=f"obs-{k:03d}",
+                left_rank=a,
+                right_rank=b,
+                xor_value=rng.randrange(2),
+                cost=rng.choice(cost_pool),
+            )
+        )
+    fixed = {r: rng.randrange(2) for r in range(n) if rng.random() < fix_prob}
+    return Problem(names, tuple(observations), fixed)
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_solver_matches_brute_force_huge_costs(seed):
+    """Costs beyond 2**53 (indistinguishable in float64) stay exact."""
+    rng = random.Random(10_000 + seed)
+    n = rng.randrange(1, 8)
+    m = rng.randrange(1, 12)
+    # near-equal huge costs plus a few small ones, forcing exact tie-breaks
+    base = rng.choice([10**15, 10**18, 10**25, 2**70])
+    cost_pool = [base, base + 1, base + 2, 2 * base + 1, 1, 7]
+    problem = make_problem_with_costs(rng, n, m, cost_pool)
+    solution = solve(problem)
+
+    best_combined, best_assignments = brute_force(
+        problem.variable_names, problem.observations, problem.fixed
+    )
+    assert SCALE * solution.optimal_cost + solution.optimal_polluted_count == best_combined
+    assert solution.unique == (len(best_assignments) == 1)
+
+    names = problem.variable_names
+    lexicographic = sorted(best_assignments, key=lambda x: tuple(x[r] for r in range(n)))
+    expected = {names[r]: lexicographic[0][r] for r in range(n)}
+    assert solution.assignment == expected
+    if not solution.unique:
+        expected_second = {names[r]: lexicographic[1][r] for r in range(n)}
+        assert solution.witness == expected_second
+        assert solution.witness_polluted_cost == solution.optimal_cost
+    else:
+        assert solution.witness is None
+
+
+def test_huge_cost_self_reference_and_limbs():
+    # single fixed variable, unavoidable self-contradictory observation
+    problem = Problem(
+        ("a",),
+        (Observation("self", 0, 0, 1, 1_000_000_001),),
+        {0: 0},
+    )
+    solution = solve(problem)
+    assert solution.optimal_cost == 1_000_000_001
+    assert solution.optimal_polluted_count == 1
+    assert solution.unique is True
+    assert solution.assignment == {"a": 0}
+    assert solution.violated_ids == ("self",)
+
+
 def test_polluted_ids_sorted_and_consistent():
     problem = make_problem(random.Random(7), 6, 10, fix_prob=0.0)
     solution = solve(problem)

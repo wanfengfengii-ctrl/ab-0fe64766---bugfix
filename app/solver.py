@@ -17,25 +17,38 @@ evaluated with a few BLAS matrix products (numpy).
 
 Exactness
 ---------
-The lexicographic pair (cost, count) is minimized by evaluating two energy
-polynomials separately:
+Observation costs are arbitrary positive integers (no upper bound). Each cost
+is split into base-2**LIMB_BITS limbs (LIMB_BITS = 32), giving one quadratic
+energy polynomial per limb whose weights are integers below 2**32, plus one
+count energy with weight 1 per observation:
 
-* cost energy, weight ``c`` per observation, an integer in [0, 120 * MAX_COST]
-  (<= 1.2e11);
+* limb energy, weight ``(c >> 32*k) % 2**32`` per observation, an integer in
+  [0, 120 * (2**32 - 1)];
 * count energy, weight 1 per observation, an integer in [0, 120].
 
-Both are computed in float64. Coefficients are integer sums of at most 120
-terms, and a standard dot-product error bound (gamma_n = n * 2**-53) bounds the
-evaluation error of the cost energy by well under 0.1 (and the count energy by
-~1e-9); each block is rounded to the nearest integer and the residual is
-verified against ``ROUND_TOLERANCE``. The combined scalar objective
+All are computed in float64. Within one limb the absolute coefficients of the
+quadratic form are bounded by 600 * 2**32 (constant), 360 * 2**32 (linear)
+and 240 * 2**32 (pairwise), so every partial sum during the block evaluation
+is an integer below 2**53 and therefore exact; each block is rounded to the
+nearest integer and the residual is verified against ``ROUND_TOLERANCE`` as a
+guard. A limb *energy* is a sum of up to 120 limb weights and can exceed the
+limb base, so after evaluation the limbs of every assignment are carry-
+normalized in exact int64 arithmetic (each normalized limb < 2**LIMB_BITS,
+plus one top carry limb). The exact polluted cost of an assignment is
+
+    cost(x) = sum_k limb_cost_k(x) * 2**(LIMB_BITS * k)
+
+and assignments are ordered by the exact integer key
+``(limb_K(x), ..., limb_0(x), count(x))`` over normalized limbs, which is
+precisely the lexicographic (cost, count) order — near-equal and cancelling
+large costs are distinguished exactly. The combined scalar objective
 
     combined = SCALE * cost + count,   SCALE = MAX_OBSERVATIONS + 1
 
-is then formed in exact int64 arithmetic. Since count <= MAX_OBSERVATIONS <
-SCALE, minimizing it is exactly equivalent to the lexicographic pair. The
-chosen assignment is finally re-evaluated with pure integer arithmetic as an
-end-to-end guard.
+is then formed in arbitrary-precision integer arithmetic. Since count <=
+MAX_OBSERVATIONS < SCALE, minimizing it is exactly equivalent to the
+lexicographic pair. The chosen assignment is finally re-evaluated with pure
+integer arithmetic as an end-to-end guard.
 
 Determinism / order independence
 ---------------------------------
@@ -58,10 +71,12 @@ MAX_OBSERVATIONS = 120
 #: Must be strictly greater than the maximum possible polluted count.
 SCALE = MAX_OBSERVATIONS + 1
 
-#: Maximum accepted observation cost. With 120 observations the cost energy is
-#: then at most 1.2e11, where the float64 block evaluation error is strictly
-#: below 0.1 (see module docstring), so nearest-integer rounding is exact.
-MAX_COST_VALUE = 1_000_000_000
+#: Observation costs are split into base-2**LIMB_BITS limbs so that every
+#: per-limb energy coefficient stays far below 2**53 and the float64 block
+#: evaluation of each limb is exact (see module docstring). Costs of any
+#: magnitude are handled exactly; there is no upper bound on a cost.
+LIMB_BITS = 32
+LIMB_BASE = 1 << LIMB_BITS
 
 #: Number of "fast" (inner, block-local) free variables in the split scan.
 #: A block holds 2**FAST_BITS assignments (~524k here, ~80 MB float64/array).
@@ -216,7 +231,14 @@ def solve(problem: Problem) -> Solution:
             witness_violated_ids=() if free else None,
         )
 
-    cost_energy = _QuadraticEnergy.zeros(f)
+    # Split every cost into base-2**LIMB_BITS limbs (least significant first);
+    # each limb gets its own quadratic energy so costs of any magnitude are
+    # evaluated exactly.
+    limb_count = max(
+        1, (max(obs.cost for obs in observations).bit_length() + LIMB_BITS - 1)
+        // LIMB_BITS
+    )
+    limb_energies = [_QuadraticEnergy.zeros(f) for _ in range(limb_count)]
     count_energy = _QuadraticEnergy.zeros(f)
     for obs in observations:
         kwargs = dict(
@@ -226,14 +248,17 @@ def solve(problem: Problem) -> Solution:
             fixed=fixed,
             free_pos=free_pos,
         )
-        cost_energy.add_observation(float(obs.cost), **kwargs)
+        remaining = obs.cost
+        for limb_energy in limb_energies:
+            limb_energy.add_observation(float(remaining % LIMB_BASE), **kwargs)
+            remaining //= LIMB_BASE
         count_energy.add_observation(1.0, **kwargs)
 
-    cost_const, cost_matrix = cost_energy.matrix()
+    limb_matrices = [energy.matrix() for energy in limb_energies]
     count_const, count_matrix = count_energy.matrix()
 
     first_code, second_code, best_combined = _enumerate(
-        cost_matrix, cost_const, count_matrix, count_const, f
+        limb_matrices, count_matrix, count_const, f
     )
 
     def decode(code: int) -> dict[str, int]:
@@ -289,41 +314,50 @@ def solve(problem: Problem) -> Solution:
 
 
 def _enumerate(
-    cost_matrix: np.ndarray,
-    cost_constant: float,
+    limb_matrices: list[tuple[float, np.ndarray]],
     count_matrix: np.ndarray,
     count_constant: float,
     f: int,
 ) -> tuple[int, int, int]:
     """Scan all 2**f assignments in lexicographic order.
 
-    Returns (first_code, second_code, best_combined); second_code is -1 when
-    the optimum is unique. Variable ``pos`` is bit ``f-1-pos`` of the code, so
-    ascending codes are lexicographically ordered assignments.
+    ``limb_matrices`` holds one ``(constant, matrix)`` quadratic energy per
+    cost limb, least significant limb first: the exact polluted cost of an
+    assignment is ``sum_k energy_k * LIMB_BASE**k``. Returns (first_code,
+    second_code, best_combined); second_code is -1 when the optimum is unique.
+    Variable ``pos`` is bit ``f-1-pos`` of the code, so ascending codes are
+    lexicographically ordered assignments.
 
     The scan splits variables into slow vars (positions 0..q-1, the block
     index) and fast vars (positions q..f-1, enumerated inside a block); fast
-    bit patterns and the fast/fast quadratic contributions are built once.
-    Cost and count energies are evaluated and rounded independently, then the
-    combined int64 objective SCALE * cost + count is formed exactly.
+    bit patterns and the fast/fast quadratic contributions are built once per
+    limb. Every limb energy and the count energy is evaluated exactly (see
+    LIMB_BITS) and rounded through the ROUND_TOLERANCE guard. A limb energy
+    sums up to 120 limb weights and may exceed the limb base, so the per-
+    assignment limbs are carry-normalized in exact int64 arithmetic; the
+    assignments are then ordered by the exact integer key
+    ``(limb_K, ..., limb_0, count)`` over normalized limbs — i.e. by
+    (polluted cost, polluted count) — and the combined objective
+    ``SCALE * cost + count`` is formed in arbitrary-precision arithmetic.
     """
     p = min(f, FAST_BITS)
     q = f - p
 
-    def parts(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    lo_powers = np.arange(p - 1, -1, -1, dtype=np.int64)
+    base_index = np.arange(1 << p, dtype=np.int64)
+    fast_bits = ((base_index[:, None] >> lo_powers[None, :]) & 1).astype(np.float64)
+
+    def parts(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         m_ss = matrix[:q, :q]
         m_sf = matrix[:q, q:]
         m_ff = matrix[q:, q:]
-        lo_powers = np.arange(p - 1, -1, -1, dtype=np.int64)
-        base_index = np.arange(1 << p, dtype=np.int64)
-        fast_bits = ((base_index[:, None] >> lo_powers[None, :]) & 1).astype(np.float64)
         base = ((fast_bits @ m_ff) * fast_bits).sum(axis=1)
-        return m_ss, m_sf, fast_bits, base
+        return m_ss, m_sf, base
 
-    c_ss, c_sf, fast_bits, cost_base = parts(cost_matrix)
-    k_ss, k_sf, _, count_base = parts(count_matrix)
+    limb_parts = [(constant, *parts(matrix)) for constant, matrix in limb_matrices]
+    k_ss, k_sf, count_base = parts(count_matrix)
 
-    best_combined: int | None = None
+    best_key: tuple[int, ...] | None = None
     first_code = -1
     second_code = -1
 
@@ -337,41 +371,66 @@ def _enumerate(
             )
         return rounded.astype(np.int64)
 
-    def absorb(block: int, combined: np.ndarray) -> None:
-        nonlocal best_combined, first_code, second_code
-        minimum = int(combined.min())
-        if best_combined is not None and minimum > best_combined:
-            return
-        hits = np.flatnonzero(combined == minimum)
-        first = (block << p) + int(hits[0])
-        if best_combined is None or minimum < best_combined:
-            best_combined = minimum
-            first_code = first
+    hi_powers = np.arange(q - 1, -1, -1, dtype=np.int64)
+    for block in range(1 << q):
+        slow = ((block >> hi_powers) & 1).astype(np.float64)
+
+        # Evaluate every cost limb (least significant first) for the block.
+        limbs: list[np.ndarray] = []
+        for constant, m_ss, m_sf, base in limb_parts:
+            block_const = constant + float(slow @ m_ss @ slow)
+            cross = 2.0 * (m_sf.T @ slow)
+            limbs.append(round_exact(block_const + base + fast_bits @ cross, "cost"))
+
+        count_block_const = count_constant + float(slow @ k_ss @ slow)
+        count_cross = 2.0 * (k_sf.T @ slow)
+        count_e = round_exact(
+            count_block_const + count_base + fast_bits @ count_cross, "count"
+        )
+
+        # Carry-normalize: a limb energy sums up to 120 limb weights and may
+        # exceed LIMB_BASE. After normalization every limb is in
+        # [0, LIMB_BASE) (plus a top carry limb <= 120), so ordering by the
+        # integer key (limb_K, ..., limb_0, count) is exactly ordering by
+        # (polluted cost, polluted count). All values are far below 2**63,
+        # so the shifts and masks are exact.
+        normalized: list[np.ndarray] = []
+        carry = np.zeros(1 << p, dtype=np.int64)
+        for energy in limbs:
+            energy = energy + carry
+            normalized.append(energy & (LIMB_BASE - 1))
+            carry = energy >> LIMB_BITS
+        normalized.append(carry)
+
+        # Exact integer key of the block optimum, refined from the most
+        # significant cost limb down to the polluted count. All positions
+        # surviving the mask share every key component computed so far.
+        mask = np.ones(1 << p, dtype=bool)
+        key: list[int] = []
+        for energy in reversed(normalized):
+            minimum = int(energy[mask].min())
+            mask &= energy == minimum
+            key.append(minimum)
+
+        minimum_count = int(count_e[mask].min())
+        mask &= count_e == minimum_count
+        key.append(minimum_count)
+
+        hits = np.flatnonzero(mask)
+        block_key = tuple(key)
+        block_first = (block << p) + int(hits[0])
+        if best_key is None or block_key < best_key:
+            best_key = block_key
+            first_code = block_first
             second_code = (block << p) + int(hits[1]) if hits.size > 1 else -1
-        elif second_code < 0:
+        elif block_key == best_key and second_code < 0:
             # Same optimum, later lexicographic block: first new hit is the
             # second distinct optimal assignment.
-            second_code = first
+            second_code = block_first
 
-    if q == 0:
-        cost_e = round_exact(cost_constant + cost_base, "cost")
-        count_e = round_exact(count_constant + count_base, "count")
-        absorb(0, SCALE * cost_e + count_e)
-    else:
-        hi_powers = np.arange(q - 1, -1, -1, dtype=np.int64)
-        for block in range(1 << q):
-            slow = ((block >> hi_powers) & 1).astype(np.float64)
-            cost_block_const = cost_constant + float(slow @ c_ss @ slow)
-            count_block_const = count_constant + float(slow @ k_ss @ slow)
-            cost_cross = 2.0 * (c_sf.T @ slow)
-            count_cross = 2.0 * (k_sf.T @ slow)
-            cost_e = round_exact(
-                cost_block_const + cost_base + fast_bits @ cost_cross, "cost"
-            )
-            count_e = round_exact(
-                count_block_const + count_base + fast_bits @ count_cross, "count"
-            )
-            absorb(block, SCALE * cost_e + count_e)
-
-    assert best_combined is not None and first_code >= 0
-    return first_code, second_code, int(best_combined)
+    assert best_key is not None and first_code >= 0
+    best_cost = 0
+    for limb_value in best_key[:-1]:
+        best_cost = best_cost * LIMB_BASE + limb_value
+    best_combined = SCALE * best_cost + best_key[-1]
+    return first_code, second_code, best_combined

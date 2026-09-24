@@ -344,6 +344,117 @@ def test_consistent_duplicate_references_allowed():
     assert r.json()["adjudication"]["assignment"] == {"a": 1}
 
 
+def test_cost_above_one_billion_accepted():
+    # No upper bound on observation costs: cost == budget == 1,000,000,001.
+    payload = {
+        "variables": ["a"],
+        "observations": [
+            {"id": "self", "left": "a", "right": "a", "xor_value": 1, "cost": 1_000_000_001}
+        ],
+        "references": [{"variable": "a", "value": 0}],
+        "budget": 1_000_000_001,
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["decision"] == "accepted"
+    assert data["adjudication"]["unique_optimum"] is True
+    assert data["adjudication"]["assignment"] == {"a": 0}
+    assert data["adjudication"]["optimal"]["polluted_cost"] == 1_000_000_001
+    assert data["adjudication"]["optimal"]["polluted_count"] == 1
+    assert data["adjudication"]["polluted_observation_ids"] == ["self"]
+    assert data["budget"]["within_budget"] is True
+    assert data["budget"]["slack"] == 0
+
+    cost, count, combined, ok = recompute_from_response(payload, data)
+    assert ok
+    assert cost == 1_000_000_001
+    assert count == 1
+    assert combined == data["adjudication"]["optimal"]["combined_objective"]
+
+
+def test_budget_above_one_trillion_accepted():
+    # No upper bound on the budget either.
+    payload = {
+        "variables": ["a"],
+        "observations": [],
+        "references": [{"variable": "a", "value": 0}],
+        "budget": 1_000_000_000_001,
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["decision"] == "accepted"
+    assert data["adjudication"]["unique_optimum"] is True
+    assert data["adjudication"]["optimal"]["polluted_cost"] == 0
+    assert data["budget"]["within_budget"] is True
+    assert data["budget"]["slack"] == 1_000_000_000_001
+
+
+def test_near_equal_huge_costs_decide_optimum():
+    # 10**18 and 10**18 + 1 coincide in float64; the adjudication must still
+    # prefer polluting the cheaper observation, exactly.
+    big = 10**18
+    payload = {
+        "variables": ["a", "b"],
+        "observations": [
+            {"id": "eq", "left": "a", "right": "b", "xor_value": 1, "cost": big},
+            {"id": "ne", "left": "a", "right": "b", "xor_value": 0, "cost": big + 1},
+        ],
+        "references": [],
+        "budget": 2 * big,
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # a == b satisfies "ne" and pollutes "eq" (cost big); a != b pollutes
+    # "ne" (cost big + 1). Optimum pollutes "eq" only.
+    assert data["adjudication"]["optimal"]["polluted_cost"] == big
+    assert data["adjudication"]["optimal"]["polluted_count"] == 1
+    assert data["adjudication"]["polluted_observation_ids"] == ["eq"]
+    assert data["adjudication"]["assignment"] == {"a": 0, "b": 0}
+    assert data["adjudication"]["unique_optimum"] is False
+    witness = data["adjudication"]["witness"]
+    assert witness["assignment"] == {"a": 1, "b": 1}
+    assert witness["polluted_cost"] == big
+    assert witness["polluted_count"] == 1
+
+    cost, count, combined, ok = recompute_from_response(payload, data)
+    assert ok and cost == big and count == 1
+    wcost, wcount, wcombined, wok = recompute_from_response(payload, data, which="witness")
+    assert wok and (wcost, wcount) == (big, 1)
+
+
+def test_huge_cost_cancellation_exact():
+    # xor_value=1 terms contribute negative linear coefficients; with huge
+    # weights the cancellation between constant/linear/pair terms must stay
+    # exact. Optimum: a != b pollutes only "same" (cost big).
+    big = 10**20 + 7
+    payload = {
+        "variables": ["a", "b"],
+        "observations": [
+            {"id": "same", "left": "a", "right": "b", "xor_value": 1, "cost": big},
+            {"id": "diff", "left": "a", "right": "b", "xor_value": 0, "cost": big + 1},
+            {"id": "const", "left": "a", "right": "a", "xor_value": 1, "cost": 5 * big},
+        ],
+        "references": [{"variable": "b", "value": 1}],
+        "budget": 6 * big,
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # "const" is always polluted (5*big); a=1,b=1 additionally pollutes
+    # "same" (big) while a=0,b=1 would pollute "diff" (big+1).
+    assert data["adjudication"]["assignment"] == {"a": 1, "b": 1}
+    assert data["adjudication"]["optimal"]["polluted_cost"] == 6 * big
+    assert data["adjudication"]["polluted_observation_ids"] == ["const", "same"]
+    assert data["adjudication"]["unique_optimum"] is True
+    assert data["budget"]["slack"] == 0
+
+    cost, count, combined, ok = recompute_from_response(payload, data)
+    assert ok and cost == 6 * big and count == 2
+
+
 @pytest.mark.slow
 def test_maximum_size_deterministic_and_recomputable():
     rng = random.Random(42)

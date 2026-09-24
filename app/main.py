@@ -126,16 +126,26 @@ async def _read_json_body(request: Request) -> Any:
         )
     try:
         return json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        message = "请求体不是合法 JSON"
-        if isinstance(exc, json.JSONDecodeError):
-            message = f"请求体不是合法 JSON：第 {exc.lineno} 行第 {exc.colno} 列附近解析失败"
+    except json.JSONDecodeError as exc:
         return JSONResponse(
             status_code=400,
             content={
                 "error": {
                     "code": "malformed_json",
-                    "message": message,
+                    "message": f"请求体不是合法 JSON：第 {exc.lineno} 行第 {exc.colno} 列附近解析失败",
+                    "details": [{"pointer": "", "message": str(exc)}],
+                }
+            },
+        )
+    except ValueError as exc:
+        # UnicodeDecodeError (invalid UTF-8) and the interpreter's integer
+        # digit-limit guard are ValueErrors but not JSONDecodeErrors.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "malformed_json",
+                    "message": "请求体不是合法 JSON 或超出运行时解析能力",
                     "details": [{"pointer": "", "message": str(exc)}],
                 }
             },

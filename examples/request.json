@@ -1,0 +1,10 @@
+{
+  "variables": ["F-A", "F-B", "F-C"],
+  "observations": [
+    {"id": "m1", "left": "F-A", "right": "F-B", "xor_value": 1, "cost": 10},
+    {"id": "m2", "left": "F-B", "right": "F-C", "xor_value": 0, "cost": 7},
+    {"id": "m3", "left": "F-A", "right": "F-C", "xor_value": 1, "cost": 3}
+  ],
+  "references": [{"variable": "F-A", "value": 1}],
+  "budget": 5
+}

@@ -1,0 +1,48 @@
+services:
+  feeder-phase-adjudicator:
+    build: .
+    image: feeder-phase-adjudicator:1.0.0
+    # 宿主机端口通过环境变量 HOST_PORT 配置，默认 8000；容器内固定 8000。
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2); sys.exit(0 if json.load(r).get('status')=='ok' else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+  verify:
+    image: feeder-phase-adjudicator:1.0.0
+    depends_on:
+      feeder-phase-adjudicator:
+        condition: service_healthy
+    command:
+      - python
+      - -c
+      - |
+        import json
+        import urllib.request
+
+        base = "http://feeder-phase-adjudicator:8000"
+        with urllib.request.urlopen(base + "/health", timeout=10) as response:
+            assert response.status == 200
+            assert json.load(response)["status"] == "ok"
+        payload = {
+            "variables": ["a"],
+            "observations": [],
+            "references": [{"variable": "a", "value": 0}],
+            "budget": 0,
+        }
+        request = urllib.request.Request(
+            base + "/api/v1/adjudicate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            assert response.status == 200
+            body = json.load(response)
+        assert body["decision"] == "accepted"
+        assert body["adjudication"]["optimal"]["polluted_cost"] == 0
+        print("VERIFY_OK health and adjudication")
